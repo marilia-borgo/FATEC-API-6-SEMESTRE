@@ -172,9 +172,11 @@ async def mongo_db():
 
 
 @pytest.fixture(autouse=True)
-def mock_mongo_db(mongo_db):
+def mock_mongo_db():
+    mock_db = MagicMock()
+    mock_db.jobs.insert_one = AsyncMock()
     with patch("backend.services.pipeline_trigger.get_mongo_async_db") as mocked_get_db:
-        mocked_get_db.return_value = mongo_db
+        mocked_get_db.return_value = mock_db
         yield mocked_get_db
 
 

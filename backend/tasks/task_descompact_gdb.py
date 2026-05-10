@@ -5,6 +5,7 @@ from pathlib import Path
 
 import fiona
 from celery import chord, signature
+from celery.exceptions import Ignore
 
 from backend.tasks.celery_app import celery_app
 
@@ -16,7 +17,6 @@ SSDMT_PARALLEL_CHUNK_SIZE = int(os.getenv('SSDMT_PARALLEL_CHUNK_SIZE', '0'))
 REQUIRED_SCHEMA: dict[str, set[str]] = {
     'CTMT': {
         'COD_ID',
-        'NOME',
         'DIST',
         'ENE_01',
         'ENE_02',
@@ -72,7 +72,7 @@ REQUIRED_SCHEMA: dict[str, set[str]] = {
         'COMP',
         'DIST',
     },
-    'CONJ': {'COD_ID', 'NOME', 'DIST'},
+    'CONJ': {'COD_ID', 'DIST'},
     'UNSEMT': {'COD_ID', 'CONJ', 'TIP_UNID', 'SIT_ATIV'},
 }
 
@@ -219,31 +219,22 @@ def task_descompact_gdb(
                 )
             )
 
-        chord(
-            header_tasks,
-            signature(
-                'etl.finalizar',
-                args=(job_id, zip_path, str(tmp_dir), distribuidora_id),
-            ),
-        ).delay()
         logger.info(
-            '[task_descompact_gdb] Chord disparado. job_id=%s callbacks=etl.finalizar tasks=%s',
+            '[task_descompact_gdb] Substituindo pela chord na chain. job_id=%s callback=etl.finalizar tasks=%s',
             job_id,
             len(header_tasks),
         )
-
-        result = {
-            'job_id': job_id,
-            'distribuidora_id': distribuidora_id,
-            'gdb_path': gdb_path,
-            'status': 'extracted',
-        }
-        logger.info(
-            '[task_descompact_gdb] Task finalizada com sucesso. job_id=%s status=%s',
-            job_id,
-            result['status'],
+        raise self.replace(
+            chord(
+                header_tasks,
+                signature(
+                    'etl.finalizar',
+                    args=(job_id, zip_path, str(tmp_dir), distribuidora_id),
+                ),
+            )
         )
-        return result
+    except Ignore:
+        raise
     except Exception as exc:
         logger.exception(
             '[task_descompact_gdb] Falha na extracao/validacao. job_id=%s erro=%s',
