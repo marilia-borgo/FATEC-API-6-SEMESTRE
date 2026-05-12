@@ -1,6 +1,22 @@
 from http import HTTPStatus
 
-from core.schemas import UserPublic
+from backend.core.schemas import UserPublic
+
+
+async def test_get_me_returns_current_user(client, user, token):
+    response = await client.get(
+        '/users/me',
+        cookies={'access_token': token},
+    )
+    assert response.status_code == HTTPStatus.OK
+    data = response.json()
+    assert data['email'] == user.email
+    assert data['username'] == user.username
+
+
+async def test_get_me_without_cookie_returns_401(client):
+    response = await client.get('/users/me')
+    assert response.status_code == HTTPStatus.UNAUTHORIZED
 
 
 async def test_create_user(client):
@@ -31,7 +47,7 @@ async def test_read_users(client, user):
 async def test_update_user(client, user, token):
     response = await client.put(
         f'/users/{user.id}',
-        headers={'Authorization': f'Bearer {token}'},
+        cookies={'access_token': token},
         json={
             'username': 'testeusername2',
             'email': 'test@test.com',
@@ -49,7 +65,7 @@ async def test_update_user(client, user, token):
 async def test_delete_user(client, user, token):
     response = await client.delete(
         f'/users/{user.id}',
-        headers={'Authorization': f'Bearer {token}'},
+        cookies={'access_token': token},
     )
     assert response.status_code == HTTPStatus.OK
     assert response.json() == {'message': 'User deleted'}
@@ -58,7 +74,7 @@ async def test_delete_user(client, user, token):
 async def test_delete_wrong_user(client, other_user, token):
     response = await client.delete(
         f'/users/{other_user.id}',
-        headers={'Authorization': f'Bearer {token}'},
+        cookies={'access_token': token},
     )
     assert response.status_code == HTTPStatus.FORBIDDEN
     assert response.json() == {'detail': 'Not enough permission'}
@@ -67,7 +83,7 @@ async def test_delete_wrong_user(client, other_user, token):
 async def test_update_user_with_wrong_user(client, other_user, token):
     response = await client.put(
         f'/users/{other_user.id}',
-        headers={'Authorization': f'Bearer {token}'},
+        cookies={'access_token': token},
         json={
             'username': 'bob',
             'email': 'bob@example.com',

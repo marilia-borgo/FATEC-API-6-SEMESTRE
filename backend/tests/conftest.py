@@ -102,11 +102,11 @@ async def other_user(session):
 
 @pytest_asyncio.fixture()
 async def token(client, user):
-    response = await client.post(
+    await client.post(
         '/auth/token',
         data={'username': user.email, 'password': user.clean_password},
     )
-    return response.json()['access_token']
+    return client.cookies['access_token']
 
 
 @pytest_asyncio.fixture

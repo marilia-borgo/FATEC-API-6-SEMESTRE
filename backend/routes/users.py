@@ -1,11 +1,12 @@
 from http import HTTPStatus
 from typing import Annotated
 
-from backend.database import get_session
-from backend.security import get_current_user, get_password_hash
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import Select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from backend.database import get_session
+from backend.security import get_current_user, get_password_hash
 
 from ..core.models import User
 from ..core.schemas import Message, UserList, UserPublic, UserSchema
@@ -13,6 +14,11 @@ from ..core.schemas import Message, UserList, UserPublic, UserSchema
 router = APIRouter(prefix='/users', tags=['users'])
 T_Session = Annotated[AsyncSession, Depends(get_session)]
 T_Current_user = Annotated[User, Depends(get_current_user)]
+
+
+@router.get('/me', response_model=UserPublic)
+async def get_current_user_profile(current_user: T_Current_user):
+    return current_user
 
 
 @router.post('/', status_code=HTTPStatus.CREATED, response_model=UserPublic)
