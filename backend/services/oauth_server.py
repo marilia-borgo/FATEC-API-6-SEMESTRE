@@ -1,4 +1,5 @@
 # ruff: noqa: PLR6301
+import secrets
 import time
 
 from authlib.oauth2 import AuthorizationServer
@@ -11,28 +12,45 @@ from authlib.oauth2.rfc6749.requests import (
     JsonRequest,
     OAuth2Request,
 )
+from authlib.oauth2.rfc6750 import BearerTokenGenerator
 from authlib.oauth2.rfc7636 import CodeChallenge
 from authlib.oidc.core import UserInfo
 from authlib.oidc.core.grants import OpenIDCode
 from sqlalchemy import select
 
+import backend.database as _db
 from backend.core.models import User
 from backend.core.oauth_models import (
     OAuth2AuthorizationCode,
     OAuth2Client,
     OAuth2Token,
 )
-from backend.database import SyncSession
 from backend.settings import Settings
 
 settings = Settings()
 
 
 # ---------------------------------------------------------------------------
-# Authorization Code Grant with PKCE + OIDC
+# Request adapter
 # ---------------------------------------------------------------------------
 
-class AuthCodeGrant(AuthorizationCodeGrant, OpenIDCode):
+class _AppOAuth2Request(OAuth2Request):
+    """Exposes payload data via the legacy .form property."""
+
+    @property
+    def form(self):
+        return self.payload.data if self.payload else {}
+
+    @property
+    def args(self):
+        return {}
+
+
+# ---------------------------------------------------------------------------
+# Authorization Code Grant
+# ---------------------------------------------------------------------------
+
+class AuthCodeGrant(AuthorizationCodeGrant):
     AUTHORIZATION_CODE_LENGTH = 48
     TOKEN_ENDPOINT_AUTH_METHODS = [
         'client_secret_basic',
@@ -40,10 +58,8 @@ class AuthCodeGrant(AuthorizationCodeGrant, OpenIDCode):
         'none',
     ]
 
-    # -- AuthorizationCodeGrant required methods ----------------------------
-
     def save_authorization_code(self, code, request):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             auth_code = OAuth2AuthorizationCode(
                 code=code,
                 client_id=request.payload.client_id,
@@ -60,7 +76,7 @@ class AuthCodeGrant(AuthorizationCodeGrant, OpenIDCode):
             s.commit()
 
     def query_authorization_code(self, code, client):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             return s.scalar(
                 select(OAuth2AuthorizationCode).where(
                     OAuth2AuthorizationCode.code == code,
@@ -69,22 +85,24 @@ class AuthCodeGrant(AuthorizationCodeGrant, OpenIDCode):
             )
 
     def delete_authorization_code(self, authorization_code):
-        with SyncSession() as s:
-            obj = s.get(
-                OAuth2AuthorizationCode, authorization_code.id
-            )
+        with _db.SyncSession() as s:
+            obj = s.get(OAuth2AuthorizationCode, authorization_code.id)
             if obj:
                 s.delete(obj)
                 s.commit()
 
     def authenticate_user(self, authorization_code):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             return s.get(User, authorization_code.user_id)
 
-    # -- OpenIDCode required methods ----------------------------------------
 
+# ---------------------------------------------------------------------------
+# OIDC extension (registered as an extension, not a mixin)
+# ---------------------------------------------------------------------------
+
+class OIDCCodeExtension(OpenIDCode):
     def exists_nonce(self, nonce, request):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             return bool(
                 s.scalar(
                     select(OAuth2AuthorizationCode).where(
@@ -124,7 +142,7 @@ class AppRefreshTokenGrant(RefreshTokenGrant):
     ]
 
     def authenticate_refresh_token(self, refresh_token):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             token = s.scalar(
                 select(OAuth2Token).where(
                     OAuth2Token.refresh_token == refresh_token
@@ -135,11 +153,11 @@ class AppRefreshTokenGrant(RefreshTokenGrant):
             return None
 
     def authenticate_user(self, credential):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             return s.get(User, credential.user_id)
 
     def revoke_old_credential(self, credential):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             obj = s.get(OAuth2Token, credential.id)
             if obj:
                 obj.access_token_revoked_at = int(time.time())
@@ -153,7 +171,7 @@ class AppRefreshTokenGrant(RefreshTokenGrant):
 
 class FastAPIAuthorizationServer(AuthorizationServer):
     def create_oauth2_request(self, request):
-        oauth_req = OAuth2Request(
+        oauth_req = _AppOAuth2Request(
             method=request.method,
             uri=str(request.uri),
             headers=dict(request.headers),
@@ -172,7 +190,7 @@ class FastAPIAuthorizationServer(AuthorizationServer):
         return status, body, headers
 
     def query_client(self, client_id):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             return s.scalar(
                 select(OAuth2Client).where(
                     OAuth2Client.client_id == client_id
@@ -180,7 +198,7 @@ class FastAPIAuthorizationServer(AuthorizationServer):
             )
 
     def save_token(self, token, request):
-        with SyncSession() as s:
+        with _db.SyncSession() as s:
             user_id = request.user.id if request.user else None
             item = OAuth2Token(
                 client_id=request.payload.client_id,
@@ -203,6 +221,14 @@ oauth_server = FastAPIAuthorizationServer(
 )
 oauth_server.register_grant(
     AuthCodeGrant,
-    [CodeChallenge(required=True)],
+    [CodeChallenge(required=True), OIDCCodeExtension()],
 )
 oauth_server.register_grant(AppRefreshTokenGrant)
+oauth_server.register_token_generator(
+    'default',
+    BearerTokenGenerator(
+        access_token_generator=lambda **_kw: secrets.token_urlsafe(48),
+        refresh_token_generator=lambda **_kw: secrets.token_urlsafe(48),
+        expires_generator=lambda grant_type, client: 3600,
+    ),
+)

@@ -9,7 +9,11 @@ from authlib.oauth2.rfc6749.grants import (
 )
 from authlib.oauth2.rfc7636 import CodeChallenge
 
-from backend.services.oauth_server import AuthCodeGrant, oauth_server
+from backend.services.oauth_server import (
+    AuthCodeGrant,
+    OIDCCodeExtension,
+    oauth_server,
+)
 
 
 def test_oauth_server_is_configured():
@@ -35,7 +39,7 @@ def _fake_user():
 
 
 def test_user_info_openid_scope_returns_sub_only():
-    grant = AuthCodeGrant.__new__(AuthCodeGrant)
+    grant = OIDCCodeExtension.__new__(OIDCCodeExtension)
     user = _fake_user()
     info = grant.generate_user_info(user, 'openid')
     assert info['sub'] == '42'
@@ -44,7 +48,7 @@ def test_user_info_openid_scope_returns_sub_only():
 
 
 def test_user_info_email_scope_adds_email():
-    grant = AuthCodeGrant.__new__(AuthCodeGrant)
+    grant = OIDCCodeExtension.__new__(OIDCCodeExtension)
     user = _fake_user()
     info = grant.generate_user_info(user, 'openid email')
     assert info['sub'] == '42'
@@ -53,7 +57,7 @@ def test_user_info_email_scope_adds_email():
 
 
 def test_user_info_profile_scope_adds_username():
-    grant = AuthCodeGrant.__new__(AuthCodeGrant)
+    grant = OIDCCodeExtension.__new__(OIDCCodeExtension)
     user = _fake_user()
     info = grant.generate_user_info(user, 'openid profile')
     assert info['sub'] == '42'
