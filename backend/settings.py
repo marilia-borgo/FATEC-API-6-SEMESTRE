@@ -16,6 +16,10 @@ class Settings(BaseSettings):
     POSTGRES_USER: str
     POSTGRES_PASSWORD: str
 
+    @property
+    def DATABASE_URL_SYNC(self) -> str:
+        return self.DATABASE_URL.replace('+asyncpg', '+psycopg2')
+
     MONGO_URI: str
     MONGO_DB: str = 'fatec_api'
 
