@@ -1,20 +1,30 @@
 import uuid
 from datetime import datetime, timezone
 
-from backend.tasks.task_calculate_pt_pnt import task_calculate_pt_pnt
-import httpx
+from backend.tasks.task_render_sam import task_render_sam
 from celery import chain
-
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.core.models import Distribuidora
-from backend.tasks.task_criticidade import task_mapa_criticidade, task_score_criticidade
-from backend.tasks.task_download_gdb import task_download_gdb
+from backend.core.models import Distribuidora, DistribuidoraCnpj
+from backend.tasks.task_calculate_pt_pnt import task_calculate_pt_pnt
+from backend.tasks.task_calculate_sam import task_calculate_sam
+from backend.tasks.task_criticidade import (
+    task_mapa_criticidade,
+    task_score_criticidade,
+)
+from backend.tasks.task_download_gdb import DOWNLOAD_DIR, task_download_gdb
+from backend.tasks.task_descompact_gdb import task_descompact_gdb
 from backend.tasks.task_render_criticidade import (
     task_render_mapa_calor,
     task_render_tabela_score,
 )
+from backend.tasks.task_render_pt_and_pnt import task_render_pt_pnt
+from backend.tasks.task_tam import task_calcular_tam
+from backend.tasks.task_render_tam import task_render_grafico_tam
+from backend.tasks.task_report import task_gerar_report
+from backend.tasks.task_cleanup_files import task_cleanup_files
+from backend.database import get_mongo_async_db
 
 ARCGIS_ITEM_URL = 'https://www.arcgis.com/sharing/rest/content/items/{item_id}'
 ARCGIS_DOWNLOAD_URL = (
@@ -39,6 +49,18 @@ async def _get_distribuidora_name(
     return dist_name
 
 
+async def _get_distribuidora_cnpj(
+    session: AsyncSession,
+    distribuidora_id: str,
+) -> str | None:
+    stmt = select(DistribuidoraCnpj.cnpj).where(
+        DistribuidoraCnpj.dist_id == distribuidora_id,
+        DistribuidoraCnpj.cnpj_enrichment_status == 'matched',
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
 async def distribuidora_job_already_triggered(
     session: AsyncSession,
     distribuidora_id: str,
@@ -52,45 +74,62 @@ async def distribuidora_job_already_triggered(
     return result.scalar_one_or_none() is not None
 
 
-async def resolve_download_url_from_aneel(
+async def _get_existing_job_id(
+    session: AsyncSession,
     distribuidora_id: str,
-    client: httpx.AsyncClient | None = None,
-) -> str:
-    metadata_url = ARCGIS_ITEM_URL.format(item_id=distribuidora_id)
-    params = {'f': 'json'}
+    ano: int,
+) -> str | None:
+    stmt = select(Distribuidora.job_id).where(
+        Distribuidora.id == distribuidora_id,
+        Distribuidora.date_gdb == ano,
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
 
-    try:
-        if client is None:
-            async with httpx.AsyncClient(timeout=15.0) as managed_client:
-                response = await managed_client.get(
-                    metadata_url, params=params
-                )
-        else:
-            response = await client.get(metadata_url, params=params)
-    except httpx.HTTPError as exc:
-        raise RuntimeError('ANEEL indisponível no momento') from exc
 
-    if response.status_code == 404:
-        raise LookupError('Item não encontrado na ANEEL')
+async def _trigger_replot_flow(
+    session: AsyncSession,
+    distribuidora_id: str,
+    ano: int,
+    user_email: str,
+    job_id: str,
+    job_doc: dict,
+) -> dict:
+    """Regera imagens a partir dos dados já calculados e remonta o relatório."""
+    dist_name = job_doc.get('dist_name', '')
+    sig_agente = dist_name.replace('_', ' ')
 
-    if response.status_code >= 500:
-        raise RuntimeError('ANEEL indisponível no momento')
+    db = get_mongo_async_db()
+    await db.jobs.update_one(
+        {'job_id': job_id},
+        {'$set': {'report_status': 'pending', 'user_email': user_email}},
+    )
 
-    if response.status_code >= 400:
-        raise LookupError('Item não encontrado na ANEEL')
+    result = chain(
+        task_render_pt_pnt.si(job_id, distribuidora_id, sig_agente, ano),
+        task_render_grafico_tam.si(job_id),
+        task_render_tabela_score.si(job_id, sig_agente, ano),
+        task_render_mapa_calor.si(job_id, sig_agente, ano),
+        task_render_sam.si(job_id, distribuidora_id, sig_agente, ano),
+        task_gerar_report.si(job_id),
+        task_cleanup_files.si(job_id),
+    ).delay()
 
-    payload = response.json()
-    if 'error' in payload:
-        code = payload.get('error', {}).get('code')
-        if code == 404:
-            raise LookupError('Item não encontrado na ANEEL')
-        raise RuntimeError('ANEEL indisponível no momento')
+    await save_distribuidora_job_tracking(
+        session=session,
+        distribuidora_id=distribuidora_id,
+        ano=ano,
+        job_id=job_id,
+    )
 
-    item_type = payload.get('type')
-    if item_type not in ALLOWED_ITEM_TYPES:
-        raise LookupError('Item não compatível com download GDB')
-
-    return ARCGIS_DOWNLOAD_URL.format(item_id=distribuidora_id)
+    return {
+        'job_id': job_id,
+        'task_id': result.id,
+        'status': 'queued',
+        'distribuidora_id': distribuidora_id,
+        'ano': ano,
+        'download_url': ARCGIS_DOWNLOAD_URL.format(item_id=distribuidora_id),
+    }
 
 
 async def save_distribuidora_job_tracking(
@@ -114,15 +153,52 @@ async def save_distribuidora_job_tracking(
     await session.commit()
 
 
+async def init_tam_metadata(
+    session: AsyncSession,
+    distribuidora_id: str,
+    ano: int,
+    job_id: str,
+    user_email: str,
+) -> None:
+    """Inicializa os dados do Job no MongoDB para que as tasks futuras tenham acesso."""
+
+    stmt = select(Distribuidora.dist_name).where(
+        Distribuidora.id == distribuidora_id,
+        Distribuidora.date_gdb == ano,
+    )
+
+    result = await session.execute(stmt)
+    dist_name = result.scalar_one_or_none()
+
+    db = get_mongo_async_db()
+
+    await db.jobs.insert_one({
+        "job_id": job_id,
+        "distribuidora_id": distribuidora_id,
+        "dist_name": dist_name,
+        "ano_gdb": ano,
+        "status": "started",
+        "user_email": user_email,
+        "created_at": datetime.utcnow()
+    })
+
+
 async def trigger_pipeline_flow(
     session: AsyncSession,
     distribuidora_id: str,
     ano: int,
+    user_email: str,
 ) -> dict:
     """Orquestra todos os passos da pipeline: download + criticidade + render."""
-    if await distribuidora_job_already_triggered(
-        session, distribuidora_id, ano
-    ):
+    existing_job_id = await _get_existing_job_id(session, distribuidora_id, ano)
+
+    if existing_job_id is not None:
+        db = get_mongo_async_db()
+        job_doc = await db.jobs.find_one({'job_id': existing_job_id}, {'_id': 0})
+        if job_doc and job_doc.get('report_status') in ('completed', 'failed'):
+            return await _trigger_replot_flow(
+                session, distribuidora_id, ano, user_email, existing_job_id, job_doc
+            )
         raise ValueError(
             'Pipeline já foi acionada para a distribuidora no ano informado'
         )
@@ -132,17 +208,32 @@ async def trigger_pipeline_flow(
         distribuidora_id,
         ano,
     )
+    cnpj = await _get_distribuidora_cnpj(session, distribuidora_id)
+    sig_agente = dist_name.replace('_', ' ')
 
-    download_url = await resolve_download_url_from_aneel(distribuidora_id)
+    download_url = ARCGIS_DOWNLOAD_URL.format(item_id=distribuidora_id)
     job_id = str(uuid.uuid4())
+    zip_path = str(DOWNLOAD_DIR / f'{job_id}.zip')
 
     result = chain(
         task_download_gdb.si(job_id, download_url, distribuidora_id),
-        task_score_criticidade.si(job_id, dist_name, ano),
-        task_calculate_pt_pnt.si(job_id, distribuidora_id),
-        task_mapa_criticidade.si(job_id, distribuidora_id, dist_name, ano),
-        task_render_tabela_score.si(job_id, dist_name, ano),
-        task_render_mapa_calor.si(job_id, dist_name, ano),
+        task_descompact_gdb.si(job_id, zip_path, distribuidora_id),
+        task_score_criticidade.si(job_id, sig_agente, ano, cnpj),
+        task_calculate_pt_pnt.si(job_id, distribuidora_id, sig_agente, ano),
+        task_render_pt_pnt.si(job_id, distribuidora_id, sig_agente, ano),
+        task_calculate_sam.si(job_id, distribuidora_id, sig_agente, ano),
+        task_mapa_criticidade.si(job_id, distribuidora_id, sig_agente, ano, cnpj),
+        task_calcular_tam.si(job_id, {
+            "id": distribuidora_id,
+            "dist_name": sig_agente,
+            "date_gdb": ano
+        }),
+        task_render_grafico_tam.si(job_id),
+        task_render_tabela_score.si(job_id, sig_agente, ano),
+        task_render_mapa_calor.si(job_id, sig_agente, ano),
+        task_render_sam.si(job_id, distribuidora_id, sig_agente, ano),
+        task_gerar_report.si(job_id),
+        task_cleanup_files.si(job_id),
     ).delay()
 
     await save_distribuidora_job_tracking(
@@ -150,6 +241,14 @@ async def trigger_pipeline_flow(
         distribuidora_id=distribuidora_id,
         ano=ano,
         job_id=job_id,
+    )
+
+    await init_tam_metadata(
+        session=session,
+        distribuidora_id=distribuidora_id,
+        ano=ano,
+        job_id=job_id,
+        user_email=user_email,
     )
 
     return {

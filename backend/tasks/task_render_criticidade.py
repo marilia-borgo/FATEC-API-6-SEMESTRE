@@ -1,5 +1,5 @@
 import logging
-from functools import lru_cache
+import time
 from pathlib import Path
 
 import geopandas as gpd
@@ -34,37 +34,56 @@ def _cor_score(score: float) -> str:
     return '#ffcdd2'
 
 
-@lru_cache(maxsize=None)
 def _output_dir() -> Path:
     path = Path(__file__).resolve().parent.parent.parent / 'output' / 'images'
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-@celery_app.task(
-    bind=True, max_retries=MAX_WAIT_RETRIES, name='etl.render_tabela_score'
-)
+@celery_app.task(name='etl.render_tabela_score')
 def task_render_tabela_score(
-    self, job_id: str, distribuidora: str, ano: int
+    job_id: str, distribuidora: str, ano: int
 ) -> dict:
     logger.info('[task_render_tabela_score] Inicio. job_id=%s', job_id)
 
     db = get_mongo_sync_db()
     score_doc = db['score_criticidade'].find_one(
-        {'distribuidora': distribuidora.upper(), 'ano': ano}, {'_id': 0}
+        {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id}, {'_id': 0}
     )
     mapa_doc = db['mapa_criticidade'].find_one(
-        {'distribuidora': distribuidora.upper(), 'ano': ano}, {'_id': 0}
+        {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id}, {'_id': 0}
     )
 
-    if not score_doc or not mapa_doc:
-        raise self.retry(countdown=WAIT_COUNTDOWN)
+    for attempt in range(MAX_WAIT_RETRIES):
+        if score_doc and mapa_doc:
+            break
+        logger.info('[task_render_tabela_score] Aguardando dados. tentativa=%d job_id=%s', attempt + 1, job_id)
+        time.sleep(WAIT_COUNTDOWN)
+        if not score_doc:
+            score_doc = db['score_criticidade'].find_one(
+                {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id}, {'_id': 0}
+            )
+        if not mapa_doc:
+            mapa_doc = db['mapa_criticidade'].find_one(
+                {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id}, {'_id': 0}
+            )
+    else:
+        logger.warning('[task_render_tabela_score] Timeout aguardando dados. Pulando. job_id=%s', job_id)
+        db['jobs'].update_one(
+            {'job_id': job_id},
+            {'$set': {'render_paths.tabela_score': None}},
+        )
+        return {'job_id': job_id, 'status': 'skipped', 'reason': 'timeout_waiting_data'}
 
     conjuntos = mapa_doc.get('conjuntos', [])
     if not conjuntos:
         logger.warning(
             '[task_render_tabela_score] Nenhum conjunto disponível. job_id=%s',
             job_id,
+        )
+        db['jobs'].update_one(
+            {'job_id': job_id},
+            {'$set': {'render_paths.tabela_score': None}},
         )
         return {
             'job_id': job_id,
@@ -104,7 +123,7 @@ def task_render_tabela_score(
     ax.set_axis_off()
 
     table = ax.table(
-        cellText=linhas, colLabels=colunas, loc='center', cellLoc='center'
+        cellText=linhas, colLabels=colunas, loc='upper center', cellLoc='center'
     )
     table.auto_set_font_size(False)
     table.set_fontsize(8)
@@ -123,17 +142,15 @@ def task_render_tabela_score(
         )
 
     sig = score_doc.get('distribuidora', distribuidora.upper())
-    ax.set_title(
-        f'Score de Criticidade — {sig} ({ano})\n'
-        f'Score médio: {score_doc.get("score_criticidade", 0):.2f} | '
-        f'Total conjuntos: {score_doc.get("quantidade_conjuntos", n_rows)}',
-        fontsize=11,
-        pad=12,
-    )
 
     out_path = _output_dir() / f'tabela_score_{sig}_{ano}.png'
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
+
+    db['jobs'].update_one(
+        {'job_id': job_id},
+        {'$set': {'render_paths.tabela_score': str(out_path)}},
+    )
 
     logger.info(
         '[task_render_tabela_score] Concluida. job_id=%s path=%s',
@@ -143,29 +160,46 @@ def task_render_tabela_score(
     return {'job_id': job_id, 'status': 'done', 'path': str(out_path)}
 
 
-@celery_app.task(
-    bind=True, max_retries=MAX_WAIT_RETRIES, name='etl.render_mapa_calor'
-)
+@celery_app.task(name='etl.render_mapa_calor')
 def task_render_mapa_calor(
-    self, job_id: str, distribuidora: str, ano: int
+    job_id: str, distribuidora: str, ano: int
 ) -> dict:
     logger.info('[task_render_mapa_calor] Inicio. job_id=%s', job_id)
 
     db = get_mongo_sync_db()
     score_doc = db['score_criticidade'].find_one(
-        {'distribuidora': distribuidora.upper(), 'ano': ano}, {'_id': 0}
+        {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id}, {'_id': 0}
     )
     mapa_doc = db['mapa_criticidade'].find_one(
-        {'distribuidora': distribuidora.upper(), 'ano': ano},
+        {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id},
         {'_id': 0, 'job_id': 1, 'conjuntos': 1},
     )
 
-    if not score_doc or not mapa_doc:
-        raise self.retry(countdown=WAIT_COUNTDOWN)
+    for attempt in range(MAX_WAIT_RETRIES):
+        if score_doc and mapa_doc:
+            break
+        logger.info('[task_render_mapa_calor] Aguardando dados. tentativa=%d job_id=%s', attempt + 1, job_id)
+        time.sleep(WAIT_COUNTDOWN)
+        if not score_doc:
+            score_doc = db['score_criticidade'].find_one(
+                {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id}, {'_id': 0}
+            )
+        if not mapa_doc:
+            mapa_doc = db['mapa_criticidade'].find_one(
+                {'distribuidora': distribuidora.upper(), 'ano': ano, 'job_id': job_id},
+                {'_id': 0, 'job_id': 1, 'conjuntos': 1},
+            )
+    else:
+        logger.warning('[task_render_mapa_calor] Timeout aguardando dados. Pulando. job_id=%s', job_id)
+        db['jobs'].update_one(
+            {'job_id': job_id},
+            {'$set': {'render_paths.mapa_calor': None}},
+        )
+        return {'job_id': job_id, 'status': 'skipped', 'reason': 'timeout_waiting_data'}
 
     gdb_job_id = mapa_doc.get('job_id')
     if not gdb_job_id:
-        raise self.retry(countdown=WAIT_COUNTDOWN)
+        raise RuntimeError(f'[task_render_mapa_calor] job_id ausente no mapa_criticidade. job_id={job_id}')
 
     categoria_por_conj: dict[int, str] = {}
     for conj in mapa_doc.get('conjuntos', []):
@@ -179,6 +213,10 @@ def task_render_mapa_calor(
         logger.warning(
             '[task_render_mapa_calor] Nenhum conjunto com categoria. job_id=%s',
             job_id,
+        )
+        db['jobs'].update_one(
+            {'job_id': job_id},
+            {'$set': {'render_paths.mapa_calor': None}},
         )
         return {
             'job_id': job_id,
@@ -213,6 +251,10 @@ def task_render_mapa_calor(
         logger.warning(
             '[task_render_mapa_calor] Nenhuma geometria disponível. job_id=%s',
             job_id,
+        )
+        db['jobs'].update_one(
+            {'job_id': job_id},
+            {'$set': {'render_paths.mapa_calor': None}},
         )
         return {
             'job_id': job_id,
@@ -251,6 +293,11 @@ def task_render_mapa_calor(
     out_path = _output_dir() / f'mapa_calor_{sig}_{ano}.png'
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     plt.close(fig)
+
+    db['jobs'].update_one(
+        {'job_id': job_id},
+        {'$set': {'render_paths.mapa_calor': str(out_path)}},
+    )
 
     logger.info(
         '[task_render_mapa_calor] Concluida. job_id=%s path=%s',

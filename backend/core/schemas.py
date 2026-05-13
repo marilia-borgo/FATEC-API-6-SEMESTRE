@@ -45,6 +45,7 @@ class DistribuidoraPayload(BaseModel):
 class SyncDistribuidorasResponse(BaseModel):
     total_recebidas: int
     total_persistidas: int
+    enrichment_task_id: str
 
 
 class DownloadRequest(BaseModel):
@@ -74,6 +75,44 @@ class DistributorResponse(BaseModel):
     id: str
     nome: str
     ano: int
+
+
+class DistributorMetadata(BaseModel):
+    id: str
+    date_gdb: int
+    dist_name: str
+    job_id: str
+
+
+class ReportStatusResponse(BaseModel):
+    job_id: str
+    etl_status: str
+    report_status: str
+    report_pdf_path: str | None
+
+
+class TamRequest(BaseModel):
+    job_id: str
+
+
+class TamResponse(BaseModel):
+    job_id: str
+    id_dist: str
+    dist_name: str
+    ano_gdb: int
+    data_processamento: str
+    CONJ: str
+    CTMT: str
+    NOME: str | None
+    COMP_KM: float
+    model_config = ConfigDict(from_attributes=True)
+
+
+class CnpjLookupResponse(BaseModel):
+    dist_id: str
+    dist_name: str
+    cnpj_enrichment_status: str | None
+    message: str
 
 
 class OAuthClientCreate(BaseModel):

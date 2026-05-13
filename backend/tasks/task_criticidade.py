@@ -1,5 +1,6 @@
 import logging
 
+from backend.core.utils import normalize_cnpj
 from backend.database import get_mongo_sync_db
 from backend.tasks.celery_app import celery_app
 
@@ -23,14 +24,19 @@ def _classificar_criticidade(score: float) -> str:
     return 'Vermelho'
 
 
-def _buscar_realizados(db, ano: int, distribuidora: str) -> list[dict]:
+def _build_match(ano_field: str, ano: int, distribuidora: str, cnpj: str | None) -> dict:
+    base = {'sig_indicador': {'$in': ['DEC', 'FEC']}, ano_field: ano}
+    if cnpj:
+        base['num_cnpj'] = cnpj
+    else:
+        base['sig_agente'] = distribuidora.upper()
+    return base
+
+
+def _buscar_realizados(db, ano: int, distribuidora: str, cnpj: str | None = None) -> list[dict]:
     pipeline = [
         {
-            '$match': {
-                'ano_indice': ano,
-                'sig_agente': distribuidora.upper(),
-                'sig_indicador': {'$in': ['DEC', 'FEC']},
-            }
+            '$match': _build_match('ano_indice', ano, distribuidora, cnpj)
         },
         {
             '$group': {
@@ -57,14 +63,10 @@ def _buscar_realizados(db, ano: int, distribuidora: str) -> list[dict]:
     return list(db['dec_fec_realizado'].aggregate(pipeline))
 
 
-def _buscar_limites(db, ano: int, distribuidora: str) -> list[dict]:
+def _buscar_limites(db, ano: int, distribuidora: str, cnpj: str | None = None) -> list[dict]:
     pipeline = [
         {
-            '$match': {
-                'ano_limite': ano,
-                'sig_agente': distribuidora.upper(),
-                'sig_indicador': {'$in': ['DEC', 'FEC']},
-            }
+            '$match': _build_match('ano_limite', ano, distribuidora, cnpj)
         },
         {
             '$project': {
@@ -84,25 +86,41 @@ def _buscar_limites(db, ano: int, distribuidora: str) -> list[dict]:
     bind=True, max_retries=MAX_WAIT_RETRIES, name='etl.score_criticidade'
 )
 def task_score_criticidade(
-    self, job_id: str, distribuidora: str, ano: int
+    self, job_id: str, distribuidora: str, ano: int, cnpj: str | None = None
 ) -> dict:
     logger.info('[task_score_criticidade] Inicio. job_id=%s', job_id)
+
+    try:
+        cnpj = normalize_cnpj(cnpj) if cnpj else None
+    except ValueError:
+        cnpj = None
 
     db = get_mongo_sync_db()
     job = db['jobs'].find_one({'job_id': job_id})
     if not job or job.get('status') != 'completed':
         raise self.retry(countdown=WAIT_COUNTDOWN)
 
-    dados_realizados = _buscar_realizados(db, ano, distribuidora)
-    dados_limites = _buscar_limites(db, ano, distribuidora)
+    dados_realizados = _buscar_realizados(db, ano, distribuidora, cnpj)
+    dados_limites = _buscar_limites(db, ano, distribuidora, cnpj)
 
     if not dados_realizados or not dados_limites:
-        logger.warning(
-            '[task_score_criticidade] Dados não encontrados. distribuidora=%s ano=%s',
-            distribuidora,
-            ano,
+        msg = (
+            '\n'
+            '=' * 70 + '\n'
+            'ERRO CRÍTICO: Dados DEC/FEC ausentes — pipeline interrompida\n'
+            '=' * 70 + '\n'
+            f'  Distribuidora : {distribuidora.upper()}\n'
+            f'  Ano           : {ano}\n'
+            '\n'
+            '  Nenhum registro encontrado nas coleções do MongoDB:\n'
+            f'    dec_fec_realizado  (sig_agente={distribuidora.upper()}, ano_indice={ano})\n'
+            f'    dec_fec_limite     (sig_agente={distribuidora.upper()}, ano_limite={ano})\n'
+            '\n'
+            '  Carregue os dados DEC/FEC antes de executar a pipeline.\n'
+            '=' * 70
         )
-        return {'job_id': job_id, 'status': 'skipped', 'reason': 'no_data'}
+        logger.error(msg)
+        raise RuntimeError(msg)
 
     realizados_dict = {
         (r['sig_agente'], r['ide_conj'], r['sig_indicador']): r[
@@ -174,7 +192,7 @@ def task_score_criticidade(
     }
 
     db['score_criticidade'].update_one(
-        {'ano': ano, 'distribuidora': distribuidora.upper()},
+        {'ano': ano, 'distribuidora': distribuidora.upper(), 'job_id': job_id},
         {'$set': resultado},
         upsert=True,
     )
@@ -187,29 +205,45 @@ def task_score_criticidade(
     return {'job_id': job_id, 'status': 'done', 'score': score_medio}
 
 
+
 @celery_app.task(
     bind=True, max_retries=MAX_WAIT_RETRIES, name='etl.mapa_criticidade'
 )
 def task_mapa_criticidade(
-    self, job_id: str, distribuidora_id: str, distribuidora: str, ano: int
+    self, job_id: str, distribuidora_id: str, distribuidora: str, ano: int, cnpj: str | None = None
 ) -> dict:
     logger.info('[task_mapa_criticidade] Inicio. job_id=%s', job_id)
+
+    try:
+        cnpj = normalize_cnpj(cnpj) if cnpj else None
+    except ValueError:
+        cnpj = None
 
     db = get_mongo_sync_db()
     job = db['jobs'].find_one({'job_id': job_id})
     if not job or job.get('status') != 'completed':
         raise self.retry(countdown=WAIT_COUNTDOWN)
 
-    dados_realizados = _buscar_realizados(db, ano, distribuidora)
+    dados_realizados = _buscar_realizados(db, ano, distribuidora, cnpj)
     if not dados_realizados:
-        logger.warning(
-            '[task_mapa_criticidade] Sem dados realizados. distribuidora=%s ano=%s',
-            distribuidora,
-            ano,
+        msg = (
+            '\n'
+            '=' * 70 + '\n'
+            'ERRO CRÍTICO: Dados DEC/FEC ausentes — pipeline interrompida\n'
+            '=' * 70 + '\n'
+            f'  Distribuidora : {distribuidora.upper()}\n'
+            f'  Ano           : {ano}\n'
+            '\n'
+            '  Nenhum registro encontrado na coleção do MongoDB:\n'
+            f'    dec_fec_realizado  (sig_agente={distribuidora.upper()}, ano_indice={ano})\n'
+            '\n'
+            '  Carregue os dados DEC/FEC antes de executar a pipeline.\n'
+            '=' * 70
         )
-        return {'job_id': job_id, 'status': 'skipped', 'reason': 'no_data'}
+        logger.error(msg)
+        raise RuntimeError(msg)
 
-    dados_limites = _buscar_limites(db, ano, distribuidora)
+    dados_limites = _buscar_limites(db, ano, distribuidora, cnpj)
 
     realizados_dict = {
         (r['sig_agente'], r['ide_conj'], r['sig_indicador']): (
@@ -270,7 +304,7 @@ def task_mapa_criticidade(
     }
 
     db['mapa_criticidade'].update_one(
-        {'distribuidora_id': distribuidora_id, 'ano': ano},
+        {'distribuidora_id': distribuidora_id, 'ano': ano, 'job_id': job_id},
         {'$set': documento},
         upsert=True,
     )

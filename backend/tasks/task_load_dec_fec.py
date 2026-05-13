@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 from pymongo import ASCENDING, UpdateOne
 
+from backend.core.utils import normalize_cnpj
 from backend.database import get_mongo_sync_db
 from backend.tasks.celery_app import celery_app
 
@@ -15,6 +16,9 @@ logger = logging.getLogger(__name__)
 TMP_DIR = Path(os.getenv('TMP_DIR', '/data/tmp/'))
 
 CHUNK_SIZE = int(os.getenv('SSDMT_BATCH_SIZE', '10000'))
+
+_REALIZADO_KEYS = ['num_cnpj', 'ide_conj', 'sig_indicador', 'ano_indice', 'num_periodo']
+_LIMITE_KEYS = ['num_cnpj', 'ide_conj', 'sig_indicador', 'ano_limite']
 
 
 def _get_collection(name: str):
@@ -30,6 +34,22 @@ def _ensure_index(collection, fields: list[str]) -> None:
         collection.create_index(
             index_keys, unique=True, name=index_name, sparse=True
         )
+
+
+def _ensure_secondary_index(collection, field: str) -> None:
+    index_name = field + '_1'
+    existing = {idx['name'] for idx in collection.list_indexes()}
+    if index_name not in existing:
+        collection.create_index([(field, ASCENDING)], name=index_name)
+
+
+def _safe_normalize_cnpj(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        return normalize_cnpj(value)
+    except ValueError:
+        return None
 
 
 def _download_csv(url: str, dest: Path) -> None:
@@ -71,12 +91,22 @@ def _to_str(value: str) -> str | None:
 
 def _to_int(value: str) -> int | None:
     v = value.strip() if value else ''
-    return int(v) if v else None
+    if not v:
+        return None
+    try:
+        return int(v)
+    except ValueError:
+        return None
 
 
 def _to_float(value: str) -> float | None:
     v = value.strip().replace(',', '.') if value else ''
-    return float(v) if v else None
+    if not v:
+        return None
+    try:
+        return float(v)
+    except ValueError:
+        return None
 
 
 def _to_date(value: str) -> datetime | None:
@@ -107,17 +137,10 @@ def task_load_dec_fec_realizado(self, job_id: str, url: str) -> dict:
         _download_csv(url, csv_path)
 
         collection = _get_collection('dec_fec_realizado')
-        _ensure_index(
-            collection,
-            [
-                'sig_agente',
-                'ide_conj',
-                'sig_indicador',
-                'ano_indice',
-                'num_periodo',
-            ],
-        )
+        _ensure_index(collection, _REALIZADO_KEYS)
+        _ensure_secondary_index(collection, 'sig_agente')
         total = 0
+        skipped = 0
 
         for chunk in _iter_chunks(csv_path):
             ops = []
@@ -125,7 +148,7 @@ def task_load_dec_fec_realizado(self, job_id: str, url: str) -> dict:
                 doc = {
                     'dat_geracao': _to_date(row['DatGeracaoConjuntoDados']),
                     'sig_agente': _to_str(row['SigAgente']),
-                    'num_cnpj': _to_str(row['NumCNPJ']),
+                    'num_cnpj': _safe_normalize_cnpj(_to_str(row['NumCNPJ'])),
                     'ide_conj': _to_str(row['IdeConjUndConsumidoras']),
                     'dsc_conj': _to_str(row['DscConjUndConsumidoras']),
                     'sig_indicador': _to_str(row['SigIndicador']),
@@ -133,33 +156,31 @@ def task_load_dec_fec_realizado(self, job_id: str, url: str) -> dict:
                     'num_periodo': _to_int(row['NumPeriodoIndice']),
                     'vlr_indice': _to_float(row['VlrIndiceEnviado']),
                 }
-                filtro = {
-                    'sig_agente': doc['sig_agente'],
-                    'ide_conj': doc['ide_conj'],
-                    'sig_indicador': doc['sig_indicador'],
-                    'ano_indice': doc['ano_indice'],
-                    'num_periodo': doc['num_periodo'],
-                }
-                ops.append(UpdateOne(filtro, {'$set': doc}, upsert=True))
+                if not all(doc[k] for k in _REALIZADO_KEYS):
+                    skipped += 1
+                    continue
+                total += 1
+                ops.append(UpdateOne({k: doc[k] for k in _REALIZADO_KEYS}, {'$set': doc}, upsert=True))
 
             if ops:
-                result = collection.bulk_write(ops, ordered=False)
-                total += result.upserted_count + result.modified_count
+                collection.bulk_write(ops, ordered=False)
                 logger.info(
-                    '[task_load_dec_fec_realizado] Progresso. job_id=%s linhas_salvas=%s',
+                    '[task_load_dec_fec_realizado] Progresso. job_id=%s linhas_carregadas=%s',
                     job_id,
                     total,
                 )
 
         logger.info(
-            '[task_load_dec_fec_realizado] Concluido. job_id=%s documentos=%s',
+            '[task_load_dec_fec_realizado] Concluido. job_id=%s linhas_carregadas=%s ignoradas=%s',
             job_id,
             total,
+            skipped,
         )
         return {
             'job_id': job_id,
             'status': 'done',
-            'documents_upserted': total,
+            'rows_loaded': total,
+            'rows_skipped': skipped,
         }
 
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
@@ -205,11 +226,10 @@ def task_load_dec_fec_limite(self, job_id: str, url: str) -> dict:
         _download_csv(url, csv_path)
 
         collection = _get_collection('dec_fec_limite')
-        _ensure_index(
-            collection,
-            ['sig_agente', 'ide_conj', 'sig_indicador', 'ano_limite'],
-        )
+        _ensure_index(collection, _LIMITE_KEYS)
+        _ensure_secondary_index(collection, 'sig_agente')
         total = 0
+        skipped = 0
 
         for chunk in _iter_chunks(csv_path):
             ops = []
@@ -217,34 +237,33 @@ def task_load_dec_fec_limite(self, job_id: str, url: str) -> dict:
                 doc = {
                     'dat_geracao': _to_date(row['DatGeracaoConjuntoDados']),
                     'sig_agente': _to_str(row['SigAgente']),
-                    'num_cnpj': _to_str(row['NumCNPJ']),
+                    'num_cnpj': _safe_normalize_cnpj(_to_str(row['NumCNPJ'])),
                     'ide_conj': _to_str(row['IdeConjUndConsumidoras']),
                     'dsc_conj': _to_str(row['DscConjUndConsumidoras']),
                     'sig_indicador': _to_str(row['SigIndicador']),
                     'ano_limite': _to_int(row['AnoLimiteQualidade']),
                     'vlr_limite': _to_float(row['VlrLimite']),
                 }
-                filtro = {
-                    'sig_agente': doc['sig_agente'],
-                    'ide_conj': doc['ide_conj'],
-                    'sig_indicador': doc['sig_indicador'],
-                    'ano_limite': doc['ano_limite'],
-                }
-                ops.append(UpdateOne(filtro, {'$set': doc}, upsert=True))
+                if not all(doc[k] for k in _LIMITE_KEYS):
+                    skipped += 1
+                    continue
+                total += 1
+                ops.append(UpdateOne({k: doc[k] for k in _LIMITE_KEYS}, {'$set': doc}, upsert=True))
 
             if ops:
-                result = collection.bulk_write(ops, ordered=False)
-                total += result.upserted_count + result.modified_count
+                collection.bulk_write(ops, ordered=False)
 
         logger.info(
-            '[task_load_dec_fec_limite] Concluido. job_id=%s documentos=%s',
+            '[task_load_dec_fec_limite] Concluido. job_id=%s linhas_carregadas=%s ignoradas=%s',
             job_id,
             total,
+            skipped,
         )
         return {
             'job_id': job_id,
             'status': 'done',
-            'documents_upserted': total,
+            'rows_loaded': total,
+            'rows_skipped': skipped,
         }
 
     except (httpx.HTTPError, httpx.TimeoutException) as exc:
