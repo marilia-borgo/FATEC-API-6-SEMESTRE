@@ -5,14 +5,14 @@ from http import HTTPStatus
 from typing import Annotated
 from urllib.parse import urlencode
 
-from fastapi import APIRouter, Cookie, Depends, HTTPException, Request
+from fastapi import APIRouter, Cookie, Depends, Header, HTTPException, Request
 from fastapi.responses import JSONResponse, RedirectResponse
 from jwt import decode as jwt_decode
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.core.models import User
-from backend.core.oauth_models import OAuth2Client
+from backend.core.oauth_models import OAuth2Client, OAuth2Token
 from backend.core.schemas import OAuthClientCreate, OAuthClientCreatedResponse
 from backend.database import get_session
 from backend.security import get_password_hash
@@ -219,3 +219,39 @@ async def token_endpoint(request: Request):
     )
 
     return JSONResponse(content=body, status_code=status)
+
+
+# ---------------------------------------------------------------------------
+# UserInfo Endpoint
+# ---------------------------------------------------------------------------
+
+@router.get('/userinfo')
+async def userinfo(
+    session: T_Session,
+    authorization: str | None = Header(None),
+):
+    if not authorization or not authorization.startswith('Bearer '):
+        raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED)
+
+    token_str = authorization.removeprefix('Bearer ')
+    token = await session.scalar(
+        select(OAuth2Token).where(OAuth2Token.access_token == token_str)
+    )
+
+    if not token or token.is_expired() or token.is_revoked():
+        raise HTTPException(status_code=HTTPStatus.UNAUTHORIZED)
+
+    if 'openid' not in token.scope:
+        raise HTTPException(status_code=HTTPStatus.FORBIDDEN)
+
+    user = await session.scalar(
+        select(User).where(User.id == token.user_id)
+    )
+
+    claims: dict = {'sub': str(user.id)}
+    if 'email' in token.scope:
+        claims['email'] = user.email
+    if 'profile' in token.scope:
+        claims['username'] = user.username
+
+    return claims
