@@ -13,6 +13,7 @@ from backend.app import app
 from motor.motor_asyncio import AsyncIOMotorClient
 from backend.database import get_session, get_mongo_async_database
 from backend.core import models as _models  # noqa: F401
+from backend.core import oauth_models as _oauth_models  # noqa: F401
 from backend.security import get_password_hash
 from backend.core.models import User, table_registry
 
