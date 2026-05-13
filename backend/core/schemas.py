@@ -74,3 +74,14 @@ class DistributorResponse(BaseModel):
     id: str
     nome: str
     ano: int
+
+
+class OAuthClientCreate(BaseModel):
+    client_name: str
+    redirect_uris: list[str]
+    allowed_scopes: list[str]
+
+
+class OAuthClientCreatedResponse(BaseModel):
+    client_id: str
+    client_secret: str

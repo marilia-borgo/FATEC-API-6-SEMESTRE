@@ -9,10 +9,12 @@ from .routes import (
     criticidade,
     dist,
     etl,
+    oauth,
     pipeline,
     pt_and_pnt,
     tam,
     users,
+    wellknown,
 )
 
 app = FastAPI()
@@ -27,6 +29,8 @@ app.add_middleware(
 
 app.include_router(users.router)
 app.include_router(auth.router)
+app.include_router(oauth.router)
+app.include_router(wellknown.router)
 app.include_router(criticidade.router, prefix='/etl')
 app.include_router(etl.router, prefix='/etl')
 app.include_router(pipeline.router, prefix='/pipeline')
