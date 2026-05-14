@@ -110,7 +110,7 @@ async def test_pipeline_trigger_chain_contem_todas_as_tasks(
 
     mock_chain.assert_called_once()
     sigs = mock_chain.call_args.args
-    assert len(sigs) == 14
+    assert len(sigs) == 15
 
     assert sigs[0].task == 'etl.download_gdb'
     assert sigs[0].args == (job_id, 'https://www.arcgis.com/sharing/rest/content/items/item-chain/data', 'item-chain')
