@@ -164,8 +164,7 @@ async def test_pipeline_trigger_chain_contem_todas_as_tasks(
     assert sigs[14].args == (job_id,)
 
     mock_chain.return_value.delay.assert_called_once()
-
-
+    
 @pytest.mark.asyncio
 async def test_pipeline_trigger_payload_invalido_retorna_422(client):
     response = await client.post(

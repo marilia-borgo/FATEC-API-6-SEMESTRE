@@ -5,6 +5,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use('Agg')
+
 import matplotlib.pyplot as plt
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,10 @@ def _render_forecast_chart(
 
 
 def render_prophet_forecast(cnpj: str) -> dict:
+    if cnpj is None:
+        logger.warning('[prophet_service] CNPJ não informado, pulando geração de gráficos.')
+        return {'sig_agente': None, 'render_paths': {}, 'skipped': _INDICATORS}
+    
     cnpj = int(cnpj)
     try:
         prophet_forecasts = _load_pickle(_PROPHET_FORECASTS_PATH)
