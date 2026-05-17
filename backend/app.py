@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .core.schemas import Message
 from .routes import (
     auth,
+    consent_policy,
     criticidade,
     dist,
     etl,
@@ -29,6 +30,7 @@ app.add_middleware(
 
 app.include_router(users.router)
 app.include_router(auth.router)
+app.include_router(consent_policy.router)
 app.include_router(oauth.router)
 app.include_router(wellknown.router)
 app.include_router(criticidade.router, prefix='/etl')
